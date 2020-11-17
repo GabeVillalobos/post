@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meetup_server_options = MeetupServerOptions {
         publisher_timeout: publisher_timeout,
         publisher_scan_interval: scan_interval,
+        publisher_store: None,
     };
     let meetup_server = MeetupServer::new(meetup_server_options);
     meetup_server.start_remove_process();

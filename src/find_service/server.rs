@@ -7,6 +7,7 @@ use std::io;
 use std::result::Result;
 use std::sync::{Arc, RwLock};
 use std::time;
+use std::fmt;
 use time::Duration;
 use time::SystemTime;
 use tonic::{Request, Response, Status};
@@ -15,27 +16,47 @@ fn convert_system_time_error(time_error: time::SystemTimeError) -> io::Error {
     io::Error::new(io::ErrorKind::Other, time_error)
 }
 
-type PublisherStore = Arc<RwLock<HashMap<String, proto::Registration>>>;
+type PublisherStoreMap = Arc<RwLock<HashMap<String, proto::Registration>>>;
+
+#[derive(Debug, Clone)]
+pub struct PublisherNotFoundError;
+
+impl fmt::Display for PublisherNotFoundError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "invalid first item to double")
+    }
+}
+
+pub trait PublisherStore: Send + Sync + Clone + 'static {
+    fn insert_publisher(&self, publisher_name: String, registration: proto::Registration);
+    fn remove_publisher(&self, publisher_name: String) -> Result<(), PublisherNotFoundError>;
+    fn remove_publishers(&self, publisher_names: Vec<String>) -> Result<(), PublisherNotFoundError>;
+    fn get_publishers(&self) -> Vec<proto::Registration>;
+    fn find_publisher(&self, search_str: &String) -> Option<Vec<proto::Registration>>;
+}
 
 #[derive(Default, Clone)]
-pub struct MeetupServer {
-    publisher_store: PublisherStore,
+pub struct MeetupServer<T: PublisherStore + Clone> {
+    // publisher_store: PublisherStoreMap,
     publisher_timeout: Duration,
     publisher_scan_interval: Duration,
+    publisher_store: T
 }
 
-pub struct MeetupServerOptions {
+#[derive(Default)]
+pub struct MeetupServerOptions<T: PublisherStore> {
     pub publisher_timeout: Duration,
     pub publisher_scan_interval: Duration,
+    pub publisher_store: T,
 }
 
-impl MeetupServer {
-    pub fn new(options: MeetupServerOptions) -> MeetupServer {
+impl<T: PublisherStore + Clone> MeetupServer<T> {
+    pub fn new(options: MeetupServerOptions<T>) -> MeetupServer<T> {
         MeetupServer {
-            publisher_store: Arc::new(RwLock::new(HashMap::new())),
             publisher_timeout: options.publisher_timeout,
+            publisher_store: options.publisher_store,
             publisher_scan_interval: options.publisher_scan_interval,
-        }
+         }
     }
 
     pub fn start_remove_process(&self) {
@@ -43,45 +64,44 @@ impl MeetupServer {
     }
 
     fn remove_expired_publishers(&self) {
-        let pub_store = self.publisher_store.clone();
         let scan_interval = self.publisher_scan_interval;
 
         let _tokio_task = tokio::spawn(tokio::time::interval(scan_interval).for_each(move |_| {
             let now = time::SystemTime::now();
-            pub_store.write().unwrap().retain(|_k, v| {
-                if let Some(info) = &v.info {
-                    if let Some(expiration) = &info.expiration {
-                        match expiration.try_into() {
-                            Result::<time::SystemTime, _>::Ok(proto_time) => proto_time > now,
-                            Err(error) => {
-                                error!("Removing descriptor, Invalid time: {}", error);
-                                false
-                            }
-                        }
-                    } else {
-                        error!("Removing descriptor, No Expiration");
-                        false
-                    }
-                } else {
-                    error!("Removing descriptor, No ConnectionInfo");
-                    false
-                }
-            });
+            self.publisher_store.remove_publishers(vec![]);
+
+// |_k, v| {
+//                 if let Some(info) = &v.info {
+//                     if let Some(expiration) = &info.expiration {
+//                         match expiration.try_into() {
+//                             Result::<time::SystemTime, _>::Ok(proto_time) => proto_time > now,
+//                             Err(error) => {
+//                                 error!("Removing descriptor, Invalid time: {}", error);
+//                                 false
+//                             }
+//                         }
+//                     } else {
+//                         error!("Removing descriptor, No Expiration");
+//                         false
+//                     }
+//                 } else {
+//                     error!("Removing descriptor, No ConnectionInfo");
+//                     false
+//                 }
+//             });
             future::ready(())
         }));
     }
 }
 
 #[tonic::async_trait]
-impl FindMe for MeetupServer {
+impl<T: PublisherStore> FindMe for MeetupServer<T> {
     async fn server_status(
         &self,
         _tonic_request: Request<proto::StatusRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
-        let locked = self.publisher_store.write().unwrap();
-
         let reply = proto::StatusResponse {
-            count: locked.len() as u64,
+            count: self.publisher_store.get_publishers().len() as u64,
         };
         Ok(Response::new(reply))
     }
@@ -115,8 +135,7 @@ impl FindMe for MeetupServer {
             }),
         };
         {
-            let mut locked = self.publisher_store.write().unwrap();
-            locked.insert(name, registration);
+            self.publisher_store.insert_publisher(name, registration);
         }
 
         let reply = proto::RegistrationResponse {
@@ -130,10 +149,10 @@ impl FindMe for MeetupServer {
         tonic_request: Request<proto::SearchRequest>,
     ) -> Result<Response<proto::SearchResponse>, Status> {
         let request = tonic_request.into_inner();
-        let locked = self.publisher_store.read().unwrap();
 
-        let list = if let Some(val) = locked.get(&request.name_regex) {
-            vec![val.clone()]
+        let publishers = self.publisher_store.find_publisher(&request.name_regex);
+        let list = if let Some(val) = publishers {
+            val.clone()
         } else {
             vec![]
         };
